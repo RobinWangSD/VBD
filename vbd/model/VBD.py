@@ -4,6 +4,7 @@ from .modules import Encoder, Denoiser, GoalPredictor
 from .utils import DDPM_Sampler
 from .model_utils import inverse_kinematics, roll_out, batch_transform_trajs_to_global_frame
 from torch.nn.functional import smooth_l1_loss, cross_entropy
+import numpy as np
 
 
 class VBD(pl.LightningModule):
@@ -41,8 +42,32 @@ class VBD(pl.LightningModule):
         self._prediction_type = cfg.get('prediction_type', 'sample')
         self._schedule_type = cfg.get('schedule_type', 'cosine')
         self._replay_buffer = cfg.get('replay_buffer', False)
-        self._embeding_dim = cfg.get('embeding_dim', 5) # By default, the embed is the noised trajectory so the dimension is 5
-    
+
+        # self._predict_ego_only = cfg.get('predict_ego_only', False)
+        self._validate_full_sample = cfg.get('validate_full_sample', False)
+        self.validation_epoch_num = 0
+        self.validation_step_acc = {
+            # 'state_loss_mean': 0.,
+            # 'yaw_loss_mean': 0.,
+            'denoise_ade': 0.,
+            'denoise_fde': 0.,
+        }
+        self._validate_num_samples = cfg.get('validate_num_samples', 1)
+        self._input_type = cfg.get('input_type', 'trajectory')
+        self._normalize_action_input = cfg.get('normalize_action_input', False)
+        # self._embeding_dim = cfg.get('embeding_dim', 5) # By default, the embed is the noised trajectory so the dimension is 5
+        if self._input_type == 'trajectory':
+            self._embeding_dim = 5
+        elif self._input_type == 'action':
+            self._embeding_dim = 2 
+        
+        self._enable_prior_means = cfg.get('enable_prior_means', False)
+        self._prior_means_type = cfg.get('prior_means_type', 'steer')
+        self._prior_std = cfg.get('prior_std', 1.)
+        self._num_speed_labels = 3
+        self._num_steer_labels = 4
+        self._mean_scale = cfg.get('mean_scale', 0.) 
+
         self.encoder = Encoder(self._encoder_layers, version=self._encoder_version)
         
         self.denoiser = Denoiser(
@@ -69,11 +94,19 @@ class VBD(pl.LightningModule):
             e = cfg.get('schedule_e', 1.0),
             tau = cfg.get('schedule_tau', 1.0),
             scale = cfg.get('schedule_scale', 1.0),
+            enable_prior_means = self._enable_prior_means,
+            prior_std = self._prior_std,
+            num_speed_labels = self._num_speed_labels,
+            num_steer_labels = self._num_steer_labels,
+            mean_scale = self._mean_scale,
+            feature_len = self._future_len // self._action_len,
+            prior_means_type = self._prior_means_type,
         )
                 
         self.register_buffer('action_mean', torch.tensor(self._action_mean))  
         self.register_buffer('action_std', torch.tensor(self._action_std))
-    
+
+
     ################### Training Setup ###################
     def configure_optimizers(self):
         '''
@@ -150,7 +183,11 @@ class VBD(pl.LightningModule):
         encoder_outputs = self.encoder(inputs)
         
         if self._train_denoiser:
-            denoiser_outputs = self.forward_denoiser(encoder_outputs, noised_actions_normalized, diffusion_step)
+            denoiser_outputs = self.forward_denoiser(
+                encoder_outputs, 
+                noised_actions_normalized, 
+                diffusion_step
+                )
             output_dict.update(denoiser_outputs)
             
         if self._train_predictor:
@@ -159,7 +196,12 @@ class VBD(pl.LightningModule):
             
         return output_dict
         
-    def forward_denoiser(self, encoder_outputs, noised_actions_normalized, diffusion_step):
+    def forward_denoiser(
+        self, 
+        encoder_outputs, 
+        noised_actions_normalized, 
+        diffusion_step
+        ):
         """
         Forward pass of the denoiser module.
 
@@ -171,8 +213,15 @@ class VBD(pl.LightningModule):
         Returns:
             denoiser_outputs: Dictionary containing the denoiser outputs.
         """
-        noised_actions = self.unnormalize_actions(noised_actions_normalized)
-        denoiser_output = self.denoiser(encoder_outputs, noised_actions, diffusion_step)
+        if self._input_type == 'trajectory':
+            noised_actions = self.unnormalize_actions(noised_actions_normalized)
+            denoiser_output = self.denoiser(encoder_outputs, noised_actions, diffusion_step, rollout=True)
+        elif self._input_type == 'action':
+            if self._normalize_action_input:
+                noised_actions = noised_actions_normalized
+            else:
+                noised_actions = self.unnormalize_actions(noised_actions_normalized)
+            denoiser_output = self.denoiser(encoder_outputs, noised_actions, diffusion_step, rollout=False)
         denoised_actions_normalized = self.noise_scheduler.q_x0(
             denoiser_output, 
             diffusion_step, 
@@ -244,6 +293,9 @@ class VBD(pl.LightningModule):
         agents_future_valid = torch.ne(agents_future.sum(-1), 0)
         agents_interested = batch['agents_interested'][:, :self._agents_len]
         anchors = batch['anchors'][:, :self._agents_len]
+
+        speed_labels = batch['sdc_speed_label']
+        steer_labels = batch['sdc_steer_label']
                 
         # get actions from trajectory
         gt_actions, gt_actions_valid = inverse_kinematics(
@@ -277,16 +329,24 @@ class VBD(pl.LightningModule):
             
             # noise the input
             noised_action_normalized = self.noise_scheduler.add_noise(
-                gt_actions_normalized, #.reshape(B*A, T, D),
-                noise,
-                diffusion_steps#, .reshape(B*A),
+                original_samples = gt_actions_normalized, #.reshape(B*A, T, D),
+                noise = noise,
+                timesteps = diffusion_steps,#, .reshape(B*A),
+                speed_labels = speed_labels,
+                steer_labels = steer_labels,
+                agents_interested = agents_interested,
             )#.reshape(B, A, T, D)
             # noise = noise.reshape(B, A, T, D)
+            
 
             if self._replay_buffer:
                 with torch.no_grad():
                     # Forward for one step
-                    denoise_outputs = self.forward_denoiser(encoder_outputs, gt_actions_normalized, diffusion_steps.view(B,A))
+                    denoise_outputs = self.forward_denoiser(
+                        encoder_outputs, 
+                        gt_actions_normalized, 
+                        diffusion_steps.view(B,A)
+                        )
                     
                     x_0 = denoise_outputs['denoised_actions_normalized']
         
@@ -299,7 +359,11 @@ class VBD(pl.LightningModule):
                     )
                     noised_action_normalized = x_t_prev.detach()
             
-            denoise_outputs = self.forward_denoiser(encoder_outputs, noised_action_normalized, diffusion_steps.view(B,A))
+            denoise_outputs = self.forward_denoiser(
+                encoder_outputs = encoder_outputs, 
+                noised_actions_normalized = noised_action_normalized, 
+                diffusion_step = diffusion_steps.view(B,A)
+                )
             
             debug_outputs.update(denoise_outputs)
             debug_outputs['noise'] = noise
@@ -321,6 +385,9 @@ class VBD(pl.LightningModule):
                     x_0 = denoise_outputs['denoised_actions_normalized'],
                     x_t = noised_action_normalized,
                     timesteps=diffusion_steps,
+                    speed_labels = speed_labels,
+                    steer_labels = steer_labels,
+                    agents_interested = agents_interested,
                     gt_noise=noise,
                 )
                                 
@@ -354,7 +421,7 @@ class VBD(pl.LightningModule):
                 
 
             denoise_ade, denoise_fde = self.calculate_metrics_denoise(
-                denoised_trajs, agents_future, agents_future_valid, agents_interested, 8
+                denoised_trajs, agents_future, agents_future_valid, agents_interested, None
             )
             
             log_dict.update({
@@ -426,12 +493,179 @@ class VBD(pl.LightningModule):
             batch: Input batch.
             batch_idx: Batch index.
         """
-        loss, log_dict = self.forward_and_get_loss(batch, prefix='val/')
-        self.log_dict(log_dict, 
-                      on_step=False, on_epoch=True, sync_dist=True,
-                      prog_bar=True)
+        if not self._validate_full_sample:
+            loss, log_dict = self.forward_and_get_loss(batch, prefix='val/')
+            self.log_dict(log_dict, 
+                        on_step=False, on_epoch=True, sync_dist=True,
+                        prog_bar=True)
+            
+            return loss
+        else:
+            log_dict = self.sample_denoiser(batch, prefix='val/', calc_loss=True, num_samples=self._validate_num_samples)
+            self.validation_epoch_num += 1
+            for key in self.validation_step_acc.keys():
+                self.validation_step_acc[key] += log_dict[key]
+    
+
+    def on_validation_epoch_end(self):
+        if self._validate_full_sample:
+            end_epoch_acc = dict()
+            for key in self.validation_step_acc.keys():
+                end_epoch_acc[f'batch/{key}'] = self.validation_step_acc[key] / self.validation_epoch_num
+            self.log_dict(end_epoch_acc, sync_dist=True, prog_bar=True)
+
+    
+    def step_denoiser(
+        self, 
+        x_t: torch.Tensor, 
+        c: dict, 
+        t: int,
+        speed_labels, 
+        steer_labels, 
+        agents_interested,
+        ):
+        """
+        Perform a denoising step to sample x_{t-1} ~ P[x_{t-1} | x_t, D(x_t, c, t)].
         
-        return loss
+        Args:
+            x_t (torch.Tensor): The input tensor representing the current state. Shape: (num_batch, num_agent, num_action, action_dim)
+            c (dict): The conditional variable dictionary.
+            t (int): The number of diffusion steps.
+            
+        Returns:
+            denoiser_output (dict): The denoiser outputs.
+            x_t_prev (torch.Tensor): The tensor representing the previous noised action. Shape: (num_batch, num_agent, num_action, action_dim)
+        """
+        
+        if self.denoiser is None:
+            raise RuntimeError("Denoiser is not defined")
+        
+        # Denoise to reconstruct x_0 ~ D(x_t, c, t)
+        denoiser_output = self.forward_denoiser(
+            encoder_outputs=c,
+            noised_actions_normalized=x_t,
+            diffusion_step=t,
+        )
+            
+        x_0 = denoiser_output['denoised_actions_normalized']
+        
+        # Step to sample from P(x_t-1 | x_t, x_0)
+        x_t_prev = self.noise_scheduler.step(
+            model_output = x_0,
+            timesteps = t,
+            sample = x_t,
+            speed_labels = speed_labels, 
+            steer_labels = steer_labels, 
+            agents_interested = agents_interested,
+            prediction_type=self._prediction_type if hasattr(self, '_prediction_type') else 'sample',
+        )
+                    
+        return denoiser_output, x_t_prev
+
+    @torch.no_grad()
+    def sample_denoiser(self, batch, prefix='val/', num_samples=1, x_t = None, use_tqdm = False,  calc_loss: bool = False, **kwargs):
+        """
+        Perform denoising inference on the given batch of data.
+
+        Args:
+            batch (dict): The input batch of data.
+            guidance_func (callable, optional): A callable function that provides guidance for denoising. Defaults to None.
+            early_stop (int, optional): The index of the step at which denoising should stop. Defaults to 0.
+            skip (int, optional): The number of steps to skip between denoising iterations. Defaults to 1.
+            **kwargs: Additional keyword arguments for guidance.
+        Returns:
+            dict: The denoising outputs, including the history of noised action normalization.
+
+        """        
+
+        # Encode the scene 
+        batch = self.batch_to_device(batch, self.device)
+        
+        # Try to calculate loss
+        if True:
+            agents_future = batch['agents_future'][:, :self._agents_len]
+            agents_future_valid = torch.ne(agents_future.sum(-1), 0)
+            agents_interested = batch['agents_interested'][:, :self._agents_len]
+        
+        speed_labels = batch['sdc_speed_label']
+        steer_labels = batch['sdc_steer_label']
+            
+        ############## Run Encoder ##############
+        encoder_outputs = self.encoder(batch)
+
+        # if num_samples > 1:
+        #     encoder_outputs = duplicate_batch(encoder_outputs, num_samples)
+
+        # agents_history = encoder_outputs['agents']
+        num_batch, num_agent = agents_future.shape[:2]
+        num_step = self._future_len//self._action_len
+        action_dim = 2
+        
+        diffusion_steps = list(reversed(range(0, self.noise_scheduler.num_steps, 1)))
+
+        # History
+        x_t_history = []
+        denoiser_output_history = []
+        guide_history = []
+
+        ADE = []
+        FDE = []
+        
+        for i in range(num_samples):
+            # Inital X_T
+            if x_t is None:
+                
+                x_t = torch.randn(num_batch, num_agent, num_step, action_dim, device=self.device)
+                if self._enable_prior_means:
+                    prior_means = self.noise_scheduler.derive_prior_means(
+                        speed_labels = speed_labels, 
+                        steer_labels = steer_labels, 
+                        noised_trajectory = x_t, 
+                        agents_interested = agents_interested,
+                        ).to(device=x_t.device, dtype=x_t.dtype)
+                    x_t = x_t + prior_means
+            else:
+                x_t = x_t.to(self.device)
+
+            for t in diffusion_steps:
+                x_t_history.append(x_t.detach().cpu().numpy())
+
+                denoiser_outputs, x_t = self.step_denoiser(
+                        x_t = x_t, 
+                        c = encoder_outputs, 
+                        t = t,
+                        speed_labels = speed_labels, 
+                        steer_labels = steer_labels, 
+                        agents_interested = agents_interested,
+                    )
+                
+            # Calculate the loss and metrics
+            if True: 
+                denoised_trajs = denoiser_outputs['denoised_trajs']
+                
+                # state_loss_mean, yaw_loss_mean = self.denoise_loss(
+                #     denoised_trajs,
+                #     agents_future, agents_future_valid,
+                #     agents_interested,
+                # )
+                
+                denoise_ade, denoise_fde = self.calculate_metrics_denoise_return_all(
+                    denoised_trajs, agents_future, agents_future_valid, agents_interested, None
+                )
+                ADE.append(denoise_ade.detach().cpu().numpy())
+                FDE.append(denoise_fde.detach().cpu().numpy())
+        
+        minADE = np.concatenate(ADE, axis=-1).min(axis=-1)
+        minFDE = np.concatenate(FDE, axis=-1).min(axis=-1)
+            
+        log_dict = {
+                # 'state_loss_mean': state_loss_mean,
+                # 'yaw_loss_mean': yaw_loss_mean,
+                'denoise_ade': minADE.mean(),
+                'denoise_fde': minFDE.mean(),
+            }
+        return log_dict
+
 
     ################### Loss function ###################
     def denoise_loss(
@@ -459,7 +693,6 @@ class VBD(pl.LightningModule):
             
             agents_future = agents_future[..., 1:, :3]
             future_mask = agents_future_valid[..., 1:] * (agents_interested[..., None] > 0)
-
             # Calculate State Loss
             # [B, A, T]
             state_loss = smooth_l1_loss(denoised_trajs[..., :2], agents_future[..., :2], reduction='none').sum(-1)
@@ -597,6 +830,42 @@ class VBD(pl.LightningModule):
             denoise_FDE = denoise_mse[...,-1][gt_mask[...,-1]].mean()
             
             return denoise_ADE.item(), denoise_FDE.item()
+
+
+    @torch.no_grad()
+    def calculate_metrics_denoise_return_all(self, 
+            denoised_trajs, agents_future, agents_future_valid,
+            agents_interested, top_k = None
+        ):
+            """
+            Calculates the denoising metrics for the predicted trajectories.
+
+            Args:
+                denoised_trajs (torch.Tensor): Denoised trajectories of shape [B, A, T, 2].
+                agents_future (torch.Tensor): Ground truth future trajectories of agents of shape [B, A, T, 2].
+                agents_future_valid (torch.Tensor): Validity mask for future trajectories of agents of shape [B, A, T].
+                agents_interested (torch.Tensor): Interest mask for agents of shape [B, A].
+                top_k (int, optional): Number of top agents to consider. Defaults to None.
+
+            Returns:
+                Tuple[float, float]: A tuple containing the denoising ADE (Average Displacement Error) and FDE (Final Displacement Error).
+            """
+            
+            if not top_k:
+                top_k = self._agents_len  
+            
+            pred_traj = denoised_trajs[:, :top_k, :, :2] # [B, A, T, 2]
+            B, A, T, _ = pred_traj.shape
+            gt = agents_future[:, :top_k, 1:, :2] # [B, A, T, 2]
+            gt_mask = (agents_future_valid[:, :top_k, 1:] \
+                & (agents_interested[:, :top_k, None] > 0)).bool() # [B, A, T] 
+
+            denoise_mse = torch.norm(pred_traj - gt, dim = -1)
+            denoise_ADE = denoise_mse[gt_mask].view((B, -1, T)).mean(dim=-1)
+            denoise_FDE = denoise_mse[gt_mask].view((B, -1, T))[...,-1].view((B, -1))
+            
+            return denoise_ADE, denoise_FDE
+
     
     @torch.no_grad()
     def calculate_metrics_predict(self,

@@ -11,6 +11,9 @@ tf.config.set_visible_devices([], "GPU")
 import jax
 jax.config.update("jax_platform_name", "cpu")
 
+import sys
+sys.path.append("/robin-west/VBD")
+
 from vbd.data.dataset import WaymaxDataset
 from vbd.model.VBD import VBD
 from torch.utils.data import DataLoader
@@ -38,13 +41,19 @@ def train(cfg):
     # create dataset
     train_dataset = WaymaxDataset(
         data_dir = cfg["train_data_path"],
+        future_len = cfg["future_len"],
         anchor_path=cfg["anchor_path"],
+        predict_ego_only=cfg["predict_ego_only"],
+        action_labels_path=cfg["training_action_labels_path"],
         # max_object= cfg["agents_len"],
     )
     
     val_dataset = WaymaxDataset(
-        cfg["val_data_path"],
+        data_dir=cfg["val_data_path"],
+        future_len = cfg["future_len"],
         anchor_path=cfg["anchor_path"],
+        predict_ego_only=cfg["predict_ego_only"],
+        action_labels_path=cfg["validation_action_labels_path"],
         # max_object= cfg["agents_len"],
     )
     
@@ -66,7 +75,19 @@ def train(cfg):
     
     output_root = cfg.get("log_dir", "output")
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    model_name = f"{cfg['model_name']}_{timestamp}"
+    # model_name = f"{cfg['model_name']}_type_{cfg['prediction_type']}_schedule_{cfg['schedule_type']}_future_len_{cfg['future_len']}_input_type_{cfg['input_type']}_normalize_action_{cfg['normalize_action_input']}"
+    model_name = "{}_type_{}_schedule_{}_future_len_{}_input_type_{}_normalize_action_{}_label_{}_type_{}_scale_{}".format(
+        cfg['model_name'],
+        cfg['prediction_type'],
+        cfg['schedule_type'],
+        cfg['future_len'],
+        cfg['input_type'],
+        cfg['normalize_action_input'],
+        cfg['enable_prior_means'],
+        cfg['prior_means_type'],
+        cfg['mean_scale'],
+    )
+    
     output_path = f"{output_root}/{model_name}"
     print("Save to ", output_path)
     
@@ -106,11 +127,12 @@ def train(cfg):
     
     use_wandb = cfg.get("use_wandb", True)
     if use_wandb:
+        # wandb.login(key='caad08df59bfd0cb22f3613849ad66faeb65d4b0')
         logger = WandbLogger(
             name=model_name,
             project=cfg.get("project"),
             entity=cfg.get("username"),
-            log_model=False,
+            log_model=True,
             dir=output_path,
         )
     else:
@@ -128,19 +150,20 @@ def train(cfg):
         detect_anomaly=False,
         gradient_clip_val=1.0,  
         gradient_clip_algorithm="norm",
-        num_sanity_val_steps=0,
+        num_sanity_val_steps=3,
         precision="bf16-mixed",
         log_every_n_steps=100,
+        check_val_every_n_epoch=1,
         callbacks=[
             ModelCheckpoint(
                 dirpath=output_path,
-                save_top_k=20,
+                save_top_k=-1,
                 save_weights_only=False,
-                monitor="val/loss",
+                monitor="train/loss",
                 filename="epoch={epoch:02d}",
                 auto_insert_metric_name=False,
                 every_n_epochs=1,
-                save_on_train_epoch_end=False,
+                save_on_train_epoch_end=True,
             ),
             LearningRateMonitor(logging_interval="step")
         ]

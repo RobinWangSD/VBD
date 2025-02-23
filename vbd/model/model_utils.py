@@ -220,3 +220,17 @@ def roll_out(
             y = torch.cumsum(v_y * dt, dim=-1)
 
         return torch.stack([x, y, theta, v_x, v_y], dim=-1)   
+
+
+def construct_priors_simplex(num_labels, feature_len):
+    """
+    Construct a tensor of simplex priors (num_labels, feature_len)
+    """
+    basis = np.eye(num_labels)
+    u = np.ones(num_labels)
+    w = basis - u * (1. / (num_labels))
+    scale = np.sqrt(float(num_labels) / float(num_labels - 1.))
+    w = w * scale
+    w = np.concatenate([w, np.zeros([num_labels, feature_len - num_labels])], axis=-1)
+    prior_means = torch.from_numpy(w).float()
+    return prior_means

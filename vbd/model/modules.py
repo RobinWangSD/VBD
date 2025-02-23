@@ -165,7 +165,7 @@ class Denoiser(nn.Module):
             embedding, noise_level, 
             encodings, relations, mask
         )       
-        
+        # Denoiser(x_t, t)
         return decoder_output
     
     def reset_agent_length(self, agents_len):
@@ -295,10 +295,10 @@ class QCMHA(nn.Module):
         q, k, v = res
     
         rel_pos_q = rel_pos_v = rel_pos
-
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 3, 1)
-        v = v.permute(0, 2, 1, 3)
+        
+        q = q.permute(0, 2, 1, 3)   # B, Head, T, D
+        k = k.permute(0, 2, 3, 1)   # B, H, D, T
+        v = v.permute(0, 2, 1, 3)   # B, H, T, D
         
         dot_score = torch.matmul(q, k)
     

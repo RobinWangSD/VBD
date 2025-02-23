@@ -6,6 +6,7 @@ import numpy as np
 from waymax import datatypes
 import matplotlib as mpl
 from matplotlib import pyplot as plt
+plt.switch_backend('agg')
 
 def plot_scenario(agents, futures, polyilnes, traffic_lights):
     """

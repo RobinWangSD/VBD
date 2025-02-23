@@ -22,10 +22,18 @@ class WaymaxDataset(Dataset):
     def __init__(
         self,
         data_dir,
+        future_len,
+        predict_ego_only,
+        action_labels_path,
         anchor_path = "data/cluster_64_center_dict.pkl",
     ):
         self.data_list = glob.glob(data_dir+'/*') if data_dir is not None else []
         self.anchors = pickle.load(open(anchor_path, "rb"))
+
+        self.future_len = future_len
+        self.predict_ego_only = predict_ego_only
+
+        self.action_labels = pickle.load(open(action_labels_path, "rb"))
         
         self.__collate_fn__ = data_collate_fn
 
@@ -56,7 +64,7 @@ class WaymaxDataset(Dataset):
 
         return np.array(anchors, dtype=np.float32)
     
-    def gen_tensor(self, data):
+    def gen_tensor(self, data, scenario_id):
         """
         Generate tensors from the input data.
 
@@ -66,10 +74,16 @@ class WaymaxDataset(Dataset):
         Returns:
             dict: Dictionary of tensors.
         """
-        
-        agents_history = data['agents_history']
-        agents_interested = data['agents_interested']
-        agents_future = data['agents_future']
+        scenario = data['scenario_raw']
+        sdc_id = np.where(scenario.object_metadata.is_sdc)[0][0]
+        sdc_id_in_processed = np.where(data["agents_id"]==sdc_id)[0][0]
+        agents_history = data['agents_history'] # A, T, D 
+        if not self.predict_ego_only:
+            agents_interested = data['agents_interested']
+        else: 
+            agents_interested = np.zeros_like(data['agents_interested'])
+            agents_interested[sdc_id_in_processed] = 10
+        agents_future = data['agents_future'][:, :self.future_len + 1]
         agents_type = data['agents_type']
         traffic_light_points = data['traffic_light_points']
         polylines = data['polylines']
@@ -77,7 +91,11 @@ class WaymaxDataset(Dataset):
         relations = data['relations']
         anchors = self._process(agents_type)
 
+        steering_action_labels = self.action_labels[scenario_id]["4s_action"][0,1] 
+        speed_action_labels = self.action_labels[scenario_id]["4s_action"][0,0] 
+
         tensors = {
+            "sdc_idx": sdc_id_in_processed,
             "agents_history": torch.from_numpy(agents_history),
             "agents_interested": torch.from_numpy(agents_interested),
             "agents_future": torch.from_numpy(agents_future),
@@ -86,7 +104,9 @@ class WaymaxDataset(Dataset):
             "polylines": torch.from_numpy(polylines),
             "polylines_valid": torch.from_numpy(polylines_valid),
             "relations": torch.from_numpy(relations),
-            "anchors": torch.from_numpy(anchors)
+            "anchors": torch.from_numpy(anchors),
+            "sdc_steer_label": steering_action_labels,
+            "sdc_speed_label": speed_action_labels,
         }
         
         return tensors
@@ -94,7 +114,8 @@ class WaymaxDataset(Dataset):
     def __getitem__(self, idx):
         with open(self.data_list[idx], 'rb') as f:
             data = pickle.load(f)
-        return self.gen_tensor(data)
+        scenario_id = self.data_list[idx].split("/")[-1].rstrip(".pkl").split("_")[-1]
+        return self.gen_tensor(data, scenario_id)
 
 
 class WaymaxTestDataset(WaymaxDataset):

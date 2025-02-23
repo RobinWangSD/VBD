@@ -64,6 +64,7 @@ def data_process(
         # check if file exists
         if os.path.exists(scenario_filename):
             continue
+        print(f"generating {scenario_id}")
         
         if only_raw:
             data_dict = {'scenario_raw': scenario}
@@ -80,7 +81,9 @@ def data_process(
             
         data_dict['scenario_id'] = scenario_id
 
-        with open(scenario_filename, 'wb') as f:
+        scenario_filename_new = os.path.join(save_dir, 'more', 'scenario_'+scenario_id+'.pkl')
+
+        with open(scenario_filename_new, 'wb') as f:
             pickle.dump(data_dict, f)
         
 
