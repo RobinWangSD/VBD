@@ -59,16 +59,20 @@ def train(cfg):
     output_root = cfg.get("log_dir", "output")
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     # model_name = f"{cfg['model_name']}_type_{cfg['prediction_type']}_schedule_{cfg['schedule_type']}_future_len_{cfg['future_len']}"
-    model_name = "{}_type_{}_schedule_{}_future_len_{}_input_type_{}_normalize_action_{}_label_{}_type_{}_scale_{}".format(
+    model_name = "{}_type_{}_schedule_{}_future_len_{}_action_len_{}_input_type_{}_normalize_action_{}_label_{}_type_{}_scale_{}_cond_embed_{}_diffuse_ego_{}_num_samples_{}".format(
         cfg['model_name'],
         cfg['prediction_type'],
         cfg['schedule_type'],
         cfg['future_len'],
+        cfg['action_len'],
         cfg['input_type'],
         cfg['normalize_action_input'],
         cfg['enable_prior_means'],
         cfg['prior_means_type'],
         cfg['mean_scale'],
+        cfg.get('cond_embed_dim', None),
+        cfg.get('diffuse_ego_only', False), 
+        cfg['validate_num_samples'],
     )
     output_path = f"{output_root}/{model_name}"
     print("Save to ", output_path)
@@ -136,6 +140,7 @@ def train(cfg):
         precision="bf16-mixed",
         log_every_n_steps=100,
         check_val_every_n_epoch=1,
+        inference_mode=False,
         callbacks=[
             ModelCheckpoint(
                 dirpath=output_path,

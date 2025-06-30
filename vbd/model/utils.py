@@ -65,6 +65,12 @@ def get_beta_schedule(variant, num_diffusion_timesteps, clip_min = 1e-9, max_bet
     elif variant == 'linear':
         # scale = 0.02
         alpha_bar = partial(alpha_bar_linear, clip_min = clip_min, **kwargs)
+    elif variant == 'linear-cifar':
+        print('using linear cifar scheduling')
+        beta_start = 1e-4
+        beta_end = 0.02
+        betas = torch.linspace(beta_start, beta_end, num_diffusion_timesteps+1)
+        return betas.to(torch.float32)
 
     betas = [(1 - alpha_bar(time_step = 0)*scale)]
     for i in range(num_diffusion_timesteps):
@@ -85,6 +91,8 @@ class DDPM_Sampler(torch.nn.Module):
         mean_scale = 0.,
         feature_len = None,
         prior_means_type = 'steer',
+        emprical_priors_path = None,
+        emprical_priors_std = False,
         **kwargs
     ):
         super().__init__()
@@ -93,15 +101,35 @@ class DDPM_Sampler(torch.nn.Module):
         self.clamp_val = clamp_val
 
         self._enable_prior_means = enable_prior_means
-        self._prior_std = torch.tensor(prior_std).to(torch.float64)
         self._num_speed_labels = num_speed_labels
         self._num_steer_labels = num_steer_labels
         self._mean_scale = mean_scale
         self._feature_len = feature_len
-        self._speed_prior_means = construct_priors_simplex(self._num_speed_labels, self._feature_len) * self._mean_scale
-        self._steer_prior_means = construct_priors_simplex(self._num_steer_labels, self._feature_len) * self._mean_scale
+        # self._speed_prior_means = construct_priors_simplex(self._num_speed_labels, self._feature_len) * self._mean_scale
+        # self._steer_prior_means = construct_priors_simplex(self._num_steer_labels, self._feature_len) * self._mean_scale     
         self._prior_means_type = prior_means_type
+        self._emprical_priors_path = emprical_priors_path
+        self._emprical_priors_std = emprical_priors_std
 
+        if self._emprical_priors_path is not None:
+            with open(self._emprical_priors_path, 'rb') as _emprical_priors_f:
+                _emprical_priors = pickle.load(_emprical_priors_f)
+            self._compound_prior_means = torch.tensor(_emprical_priors['means']).to(torch.float64)
+            if self._emprical_priors_std:
+                self._prior_std = torch.tensor(_emprical_priors['stds']).to(torch.float64)
+            else:
+                self._prior_std = torch.tensor(prior_std).to(torch.float64)
+        else:
+            self._prior_std = torch.tensor(prior_std).to(torch.float64)
+            if self._prior_means_type == "steer_and_speed":
+                self._compound_prior_means = (construct_priors_simplex(self._num_steer_labels * self._num_speed_labels, self._feature_len * 2) * self._mean_scale).view(
+                    (self._num_steer_labels * self._num_speed_labels, self._feature_len, 2)
+                )   
+            elif self._prior_means_type == "steer":
+                self._compound_prior_means = (construct_priors_simplex(self._num_steer_labels, self._feature_len * 2) * self._mean_scale).view(
+                    (self._num_steer_labels, self._feature_len, 2)
+                )   
+        
         betas = get_beta_schedule(variant = self.schedule, num_diffusion_timesteps = self.num_steps, **kwargs)
         betas = betas[1:]
         betas_sqrt = betas.sqrt()
@@ -134,26 +162,54 @@ class DDPM_Sampler(torch.nn.Module):
         agents_interested: (B, A)
         """
         # TODO: better implementation wrt sdc_idxs
-        device = self._steer_prior_means.device
-        assert device == self._speed_prior_means.device
+        device = self._compound_prior_means.device
         steer_labels = steer_labels.to(device=device, dtype=torch.int64)
         speed_labels = speed_labels.to(device=device, dtype=torch.int64)
-        speed_labels = speed_labels - 1
         agents_interested = agents_interested.to(device=device)
         
         if self._prior_means_type == 'steer':
-            steer_prior_means = self._steer_prior_means[steer_labels].clone()   # B, T
-            speed_prior_means = torch.zeros_like(steer_prior_means)             # B, T
+            ego_prior_means = self._compound_prior_means[steer_labels].clone() 
         elif self._prior_means_type == 'steer_and_speed':
-            speed_prior_means = self._speed_prior_means[speed_labels].clone()   # B, T
-            steer_prior_means = self._steer_prior_means[steer_labels].clone()   # B, T
+            labels_compound = 3 * steer_labels + speed_labels - 1
+            ego_prior_means = self._compound_prior_means[labels_compound].clone()   
+            # speed_prior_means = self._speed_prior_means[speed_labels].clone()   # B, T
+            # steer_prior_means = self._steer_prior_means[steer_labels].clone()   # B, T
+
         else:
             raise NotImplementedError
 
-        ego_prior_means = torch.stack([speed_prior_means, steer_prior_means], dim=-1) # B, T, 2
         scenario_prior_means = torch.zeros_like(noised_trajectory).float().to(device)
         scenario_prior_means[agents_interested>0] = ego_prior_means.float().to(device)
         return scenario_prior_means
+    
+
+    def derive_prior_stds(self, speed_labels, steer_labels, noised_trajectory, agents_interested):
+        """
+        speed_labels: (B,)
+        steer_labels: (B,)
+        noised_trajectories: (B, A, T, D)
+        agents_interested: (B, A)
+        """
+        # TODO: better implementation wrt sdc_idxs
+        device = self._compound_prior_means.device
+        steer_labels = steer_labels.to(device=device, dtype=torch.int64)
+        speed_labels = speed_labels.to(device=device, dtype=torch.int64)
+        agents_interested = agents_interested.to(device=device)
+        
+        if self._prior_means_type == 'steer':
+            ego_prior_stds = self._prior_std[steer_labels].clone() 
+        elif self._prior_means_type == 'steer_and_speed':
+            labels_compound = 3 * steer_labels + speed_labels - 1
+            ego_prior_stds = self._prior_std[labels_compound].clone()   
+            # speed_prior_means = self._speed_prior_means[speed_labels].clone()   # B, T
+            # steer_prior_means = self._steer_prior_means[steer_labels].clone()   # B, T
+
+        else:
+            raise NotImplementedError
+
+        scenario_prior_stds = torch.zeros_like(noised_trajectory).float().to(device)
+        scenario_prior_stds[agents_interested>0] = ego_prior_stds.float().to(device)
+        return scenario_prior_stds
 
         
     @torch.no_grad()
@@ -181,6 +237,7 @@ class DDPM_Sampler(torch.nn.Module):
         noise = noise.to(device=original_samples.device, dtype=original_samples.dtype)
 
         if not self._enable_prior_means:
+            assert False
             noised_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
         else:
             etas = self.etas.to(device=original_samples.device, dtype=original_samples.dtype)
@@ -192,8 +249,12 @@ class DDPM_Sampler(torch.nn.Module):
                 eta_ts = eta_ts.unsqueeze(-1)
             mean_terms = (eta_ts * means / eta_T)
             mean_terms = mean_terms.to(device=original_samples.device, dtype=original_samples.dtype)
-
-            prior_std = self._prior_std.to(device=original_samples.device, dtype=original_samples.dtype)
+            
+            if self._emprical_priors_std:
+                prior_std = self.derive_prior_stds(speed_labels, steer_labels, original_samples, agents_interested)
+                prior_std = prior_std.to(device=original_samples.device, dtype=original_samples.dtype)
+            else:
+                prior_std = self._prior_std.to(device=original_samples.device, dtype=original_samples.dtype)
 
             noised_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * prior_std * noise + mean_terms
         
@@ -242,7 +303,11 @@ class DDPM_Sampler(torch.nn.Module):
             mean_terms = (eta_ts * means / eta_T)
             mean_terms = mean_terms.to(device=x_0.device, dtype=x_0.dtype)
 
-            prior_std = self._prior_std.to(device=x_0.device, dtype=x_0.dtype)
+            if self._emprical_priors_std:
+                prior_std = self.derive_prior_stds(speed_labels, steer_labels, x_0, agents_interested)
+                prior_std = prior_std.to(device=x_0.device, dtype=x_0.dtype)
+            else:
+                prior_std = self._prior_std.to(device=x_0.device, dtype=x_0.dtype)
             
             noise = (x_t - sqrt_alpha_prod * x_0 - mean_terms) / (sqrt_one_minus_alpha_prod * prior_std)
         
@@ -364,8 +429,30 @@ class DDPM_Sampler(torch.nn.Module):
         if prediction_type == "sample" or prediction_type == "mean":
             pred_original_sample = model_output
         elif prediction_type == "error":
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            pred_original_sample = model_output
+            # if not self._enable_prior_means:
+            #     pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            # else:
+            #     sample_coeff = 1 / current_alpha_t**0.5
+            #     eps_coeff = -(1-current_alpha_t) / ((current_alpha_t**0.5) * (beta_prod_t**0.5)) 
+            #     mean_terms_coeff = -1 / current_alpha_t**0.5
+            #     sample_coeff = sample_coeff.to(device=model_output.device, dtype=model_output.dtype)
+            #     eps_coeff = eps_coeff.to(device=model_output.device, dtype=model_output.dtype)
+            #     mean_terms_coeff = mean_terms_coeff.to(device=model_output.device, dtype=model_output.dtype)
+            #     sample = sample.to(device=model_output.device, dtype=model_output.dtype)
+
+            #     etas = self.etas.to(device=model_output.device, dtype=model_output.dtype)
+            #     means = self.derive_prior_means(speed_labels, steer_labels, sample, agents_interested)
+            #     means = means.to(device=model_output.device, dtype=model_output.dtype)
+            #     eta_T = etas[-1].to(device=model_output.device, dtype=model_output.dtype)
+            #     mean_terms = means / eta_T
+            #     mean_terms = mean_terms.to(device=model_output.device, dtype=model_output.dtype)
+            #     prior_std = self._prior_std.to(device=model_output.device, dtype=model_output.dtype)
+
+            #     pred_prev_sample_mean = sample_coeff * sample + eps_coeff * prior_std * model_output + mean_terms_coeff * mean_terms
+            #     return pred_prev_sample_mean
         elif prediction_type == "v":
+            assert False
             pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
         else:
             raise NotImplementedError
@@ -386,7 +473,7 @@ class DDPM_Sampler(torch.nn.Module):
             etas = self.etas.to(device=model_output.device, dtype=model_output.dtype)
             means = self.derive_prior_means(speed_labels, steer_labels, sample, agents_interested)
             means = means.to(device=model_output.device, dtype=model_output.dtype)
-            mean_terms_coeff = (etas_prev[timesteps] * current_beta_t - current_alpha_t ** 0.5 * beta_prod_t_prev) / ((1. - beta_prod_t) * etas[-1])
+            mean_terms_coeff = (etas_prev[timesteps] * current_beta_t - current_alpha_t ** 0.5 * beta_prod_t_prev) / ((beta_prod_t) * etas[-1])
             pred_prev_sample_mean = pred_prev_sample_mean + mean_terms_coeff * means
         return pred_prev_sample_mean 
     
@@ -395,6 +482,9 @@ class DDPM_Sampler(torch.nn.Module):
         model_output: torch.FloatTensor,
         timesteps: Union[int, torch.IntTensor],
         sample: torch.FloatTensor,
+        speed_labels, 
+        steer_labels, 
+        agents_interested,
         prediction_type: str = "sample",
     ):
         """
@@ -415,13 +505,29 @@ class DDPM_Sampler(torch.nn.Module):
         if prediction_type == "sample" or prediction_type == "mean":
             pred_original_sample = model_output
         elif prediction_type == "error":
-            assert False
             alpha_prod_t = self.alphas_cumprod[timesteps]
             for _ in range(len(sample.shape)-len(alpha_prod_t.shape)):
                 alpha_prod_t = alpha_prod_t[..., None]
             beta_prod_t = 1 - alpha_prod_t
-            
-            pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+            if not self._enable_prior_means:
+                pred_original_sample = (sample - beta_prod_t ** (0.5) * model_output) / alpha_prod_t ** (0.5)
+
+            else: 
+                prior_std = self._prior_std.to(device=model_output.device, dtype=model_output.dtype)
+
+                etas = self.etas.to(device=model_output.device, dtype=model_output.dtype)
+                eta_T = etas[-1].to(device=model_output.device, dtype=model_output.dtype)
+                means = self.derive_prior_means(speed_labels, steer_labels, sample, agents_interested)
+                means = means.to(device=model_output.device, dtype=model_output.dtype)
+                
+                eta_ts = etas[timesteps]
+                while len(eta_ts.shape) < len(model_output.shape):
+                    eta_ts = eta_ts.unsqueeze(-1)
+                mean_terms = (eta_ts * means / eta_T)
+                mean_terms = mean_terms.to(device=model_output.device, dtype=model_output.dtype)
+
+
+                pred_original_sample = (sample - (beta_prod_t ** 0.5) * prior_std * model_output - mean_terms) / alpha_prod_t ** (0.5)
         # elif prediction_type == "v":
         #     pred_original_sample = (alpha_prod_t**0.5) * sample - (beta_prod_t**0.5) * model_output
         else:

@@ -290,6 +290,68 @@ def plot_traj_with_speed(
     trajs: np.ndarray,
     speeds: np.ndarray,
     valids: np.ndarray,
+    style={'color': 'b', 'end_marker':'.'},
+    plot_freq=1,
+    fig: plt.Figure = None,
+    ax: plt.Axes = None,
+    fixed_linewidth: float = None,
+    fixed_linestyle: str = None,
+    fixed_alpha: float = None,
+    show_colorbar: bool = False,
+    v_min: float = 0,
+    v_max: float = 10,
+):
+    # print(v_min, v_max)
+    '''
+    This function plot trajectory with speed as color gradient
+    '''
+    if ax is None:
+        ax = plt.gca()
+    if fig is None:
+        fig = plt.gcf()
+
+    # plot color line
+    norm = plt.Normalize(v_min, v_max)
+    A, T, _ = trajs.shape
+    # traj have feature [center_x, center_y, center_z, length, width, height, heading, velocity_x, velocity_y, valid]
+    for a in range(A):
+        points = trajs[a]
+        speed = speeds[a]
+        valid = valids[a]
+        points = points[valid, :]
+        # segments = np.stack([points[:-1], points[1:]], axis=1)  # (N-1, 2, 2)
+        # # override config
+        # linewidth = 3 if fixed_linewidth is None else fixed_linewidth
+        # linestyle = '-' if fixed_linestyle is None else fixed_linestyle
+        # alpha = 0.8 if fixed_alpha is None else fixed_alpha
+
+        # lc = LineCollection(segments, cmap='inferno', norm=norm, linestyle=linestyle, alpha=alpha, zorder=3)
+        # # Set the values used for colormapping
+        # lc.set_array(speed)
+        # lc.set_linewidth(linewidth)
+        # line = ax.add_collection(lc)
+        # cmap = plt.get_cmap("inferno")
+        # last_color = cmap(0.3)
+        # ax.scatter(points[-1,0], points[-1,1], color=last_color, marker='x', s=50, alpha=0.8,)
+        
+        ax.plot(
+            points[::plot_freq,0], points[::plot_freq,1],
+            # alpha=0.5, color=style['color'],
+            color=style['color'],  alpha=0.5, linewidth=6
+            #marker=style['marker'], ms=14, markerfacecolor="None", markeredgecolor=style['color'], markeredgewidth=1, 
+            )
+        ax.scatter(points[-1,0], points[-1,1], color=style['color'], marker=style['end_marker'], s=200, alpha=1,)
+        # plt.plot(points[::plot_freq,0], points[::plot_freq,1] , c=style['color'] )
+
+    if False:
+        fig.colorbar(line, ax=ax, label='speed (m/s)', location='bottom', shrink=0.3, pad=0.02)
+
+
+
+def plot_traj_with_speed_gt(
+    trajs: np.ndarray,
+    speeds: np.ndarray,
+    valids: np.ndarray,
     fig: plt.Figure = None,
     ax: plt.Axes = None,
     fixed_linewidth: float = None,
@@ -323,13 +385,28 @@ def plot_traj_with_speed(
         linestyle = '-' if fixed_linestyle is None else fixed_linestyle
         alpha = 0.8 if fixed_alpha is None else fixed_alpha
 
-        lc = LineCollection(segments, cmap='inferno', norm=norm, linestyle=linestyle, alpha=alpha, zorder=3)
+        lc = LineCollection(segments, norm=norm, linestyle=linestyle, alpha=alpha, zorder=3)
         # Set the values used for colormapping
         lc.set_array(speed)
+        lc.set_color('black')
         lc.set_linewidth(linewidth)
         line = ax.add_collection(lc)
-    if show_colorbar:
+        cmap = plt.get_cmap("inferno")
+        last_color = cmap(0.3)
+        # ax.scatter(points[-1,0], points[-1,1], color='k', marker='x', s=150, alpha=0.8,)
+        
+        # ax.plot(
+        #     points[::plot_freq,0], points[::plot_freq,1],
+        #     # alpha=0.5, color=style['color'],
+        #     color=style['color'],  alpha=0.7
+        #     #marker=style['marker'], ms=14, markerfacecolor="None", markeredgecolor=style['color'], markeredgewidth=1, 
+        #     )
+        # ax.scatter(points[-1,0], points[-1,1], color=style['color'], marker=style['end_marker'], s=50, alpha=1.,)
+        # # plt.plot(points[::plot_freq,0], points[::plot_freq,1] , c=style['color'] )
+
+    if False:
         fig.colorbar(line, ax=ax, label='speed (m/s)', location='bottom', shrink=0.3, pad=0.02)
+
 
 
 def plot_traj_with_time(

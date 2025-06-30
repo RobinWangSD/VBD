@@ -14,7 +14,7 @@ jax.config.update("jax_platform_name", "cpu")
 import sys
 sys.path.append("/robin-west/VBD")
 
-from vbd.data.dataset import WaymaxDataset
+from vbd.data.dataset import WaymaxComboTestDataset
 from vbd.model.VBD import VBD
 from torch.utils.data import DataLoader
 
@@ -33,36 +33,19 @@ def load_config(file_path):
 
 
 def train(cfg):
-    print("Start Training")
+    print("Start Validating")
     
     pl.seed_everything(cfg["seed"])
     torch.set_float32_matmul_precision("high")    
         
     # create dataset
-    train_dataset = WaymaxDataset(
-        data_dir = cfg["train_data_path"],
-        future_len = cfg["future_len"],
-        anchor_path= cfg["anchor_path"],
-        predict_ego_only=cfg["predict_ego_only"],
-        action_labels_path=cfg["training_action_labels_path"],
-        # max_object= cfg["agents_len"],
-    )
-    
-    val_dataset = WaymaxDataset(
+    val_dataset = WaymaxComboTestDataset(
         data_dir=cfg["val_data_path"],
         future_len = cfg["future_len"],
         anchor_path=cfg["anchor_path"],
         predict_ego_only=cfg["predict_ego_only"],
-        action_labels_path=cfg["validation_action_labels_path"],
+        action_combo_path=cfg["random_label_path"],
         # max_object= cfg["agents_len"],
-    )
-    
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=cfg["batch_size"], 
-        pin_memory=True, 
-        num_workers=cfg["num_workers"],
-        shuffle=True
     )
     
     val_loader = DataLoader(
@@ -75,8 +58,8 @@ def train(cfg):
     
     output_root = cfg.get("log_dir", "output")
     timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    # model_name = f"{cfg['model_name']}_type_{cfg['prediction_type']}_schedule_{cfg['schedule_type']}_future_len_{cfg['future_len']}_input_type_{cfg['input_type']}_normalize_action_{cfg['normalize_action_input']}"
-    model_name = "{}_type_{}_schedule_{}_future_len_{}_action_len_{}_input_type_{}_normalize_action_{}_label_{}_type_{}_scale_{}_cond_embed_{}_diffuse_ego_{}_emp_means_{}_std_{}".format(
+    # model_name = f"{cfg['model_name']}_type_{cfg['prediction_type']}_schedule_{cfg['schedule_type']}_future_len_{cfg['future_len']}"
+    model_name = "{}_type_{}_schedule_{}_future_len_{}_action_len_{}_input_type_{}_normalize_action_{}_label_{}_type_{}_scale_{}_cond_embed_{}_diffuse_ego_{}_num_samples_{}".format(
         cfg['model_name'],
         cfg['prediction_type'],
         cfg['schedule_type'],
@@ -89,10 +72,8 @@ def train(cfg):
         cfg['mean_scale'],
         cfg.get('cond_embed_dim', None),
         cfg.get('diffuse_ego_only', False), 
-        cfg.get('emprical_priors_path', False),
-        cfg.get('emprical_priors_std', False),
+        cfg['validate_num_samples'],
     )
-    
     output_path = f"{output_root}/{model_name}"
     print("Save to ", output_path)
     
@@ -155,10 +136,11 @@ def train(cfg):
         detect_anomaly=False,
         gradient_clip_val=1.0,  
         gradient_clip_algorithm="norm",
-        num_sanity_val_steps=3,
+        num_sanity_val_steps=-1,
         precision="bf16-mixed",
         log_every_n_steps=100,
         check_val_every_n_epoch=1,
+        inference_mode=False,
         callbacks=[
             ModelCheckpoint(
                 dirpath=output_path,
@@ -175,9 +157,8 @@ def train(cfg):
     )
     print("Build Trainer")
     
-    trainer.fit(
+    trainer.validate(
         model, 
-        train_loader, 
         val_loader, 
         ckpt_path=cfg.get("init_from")
     )

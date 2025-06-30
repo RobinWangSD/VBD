@@ -9,6 +9,24 @@ from .model_utils import (batch_transform_trajs_to_local_frame,
                          batch_transform_trajs_to_global_frame,
                          roll_out)
 
+class ConditionalEmbedding(nn.Module):
+    def __init__(self, num_labels, 
+                 embed_dim,):
+        super().__init__()
+        self.condEmbedding = nn.Sequential(
+            nn.Embedding(num_embeddings = num_labels + 1, 
+                         embedding_dim = embed_dim, 
+                         padding_idx = 0),
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def forward(self, c):
+        c = c.cuda()
+        emb = self.condEmbedding(c)
+        return emb
+
 
 class Encoder(nn.Module):
     def __init__(self, layers=6, version='v1'):
@@ -117,15 +135,18 @@ class GoalPredictor(nn.Module):
 
 
 class Denoiser(nn.Module):
-    def __init__(self, future_len=80, action_len=5, agents_len=32, steps=100, input_dim=5):
+    def __init__(self, future_len=80, action_len=5, agents_len=32, steps=100, input_dim=5, num_labels=None, cond_embed_dim=None, diffuse_ego_only=False):
         super().__init__()
         self._agents_len = agents_len
         self._action_len = action_len
         self._input_dim = input_dim
         self.noise_level_embedding = nn.Embedding(steps, 256)
-        self.decoder = TransformerDecoder(future_len, agents_len, self._action_len, input_dim=self._input_dim)
+        if cond_embed_dim is not None:
+            assert num_labels is not None
+            self.cond_embedder = ConditionalEmbedding(num_labels, cond_embed_dim)
+        self.decoder = TransformerDecoder(future_len, agents_len, self._action_len, input_dim=self._input_dim, cond_embed_dim=cond_embed_dim, diffuse_ego_only=diffuse_ego_only)
 
-    def forward(self, encoder_inputs, noisy_actions, diffusion_step, rollout = True):
+    def forward(self, encoder_inputs, noisy_actions, diffusion_step, rollout = True, condition=None, cond_drop_mask=None):
         '''
         Args:
             noisy_actions: [B, A, T_r, 2], [acc, yaw_rate] Unnormalized actions
@@ -160,10 +181,21 @@ class Denoiser(nn.Module):
                                     action_len=self._action_len, global_frame=False)   
         else:
             embedding = noisy_actions
+        if hasattr(self, 'cond_embedder'):
+            assert condition is not None
+        if condition is not None and hasattr(self, 'cond_embedder'):
+            # assert False, "{condition}" 
+            cond_embed = self.cond_embedder(condition)
+            if cond_drop_mask is not None:
+                assert cond_drop_mask.shape[0] == cond_embed.shape[0]
+        else: 
+            cond_embed = None
         
         decoder_output = self.decoder(
             embedding, noise_level, 
-            encodings, relations, mask
+            encodings, relations, mask, 
+            agents_mask, 
+            cond_embed=cond_embed, cond_drop_mask=cond_drop_mask,
         )       
         # Denoiser(x_t, t)
         return decoder_output
@@ -253,7 +285,7 @@ class QCMHA(nn.Module):
         num_heads (int): The number of attention heads.
         dropout (float, optional): The dropout probability. Default is 0.1.
     """
-    
+
     def __init__(self, embed_dim, num_heads, dropout=0.1):
         super().__init__()
         self.embed_dim = embed_dim
@@ -433,7 +465,7 @@ class CrossTransformer(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, future_len, agents_len, action_len, input_dim=5, ouptut_dim = 2,  causal = True):
+    def __init__(self, future_len, agents_len, action_len, input_dim=5, ouptut_dim = 2,  causal = True, cond_embed_dim=None, diffuse_ego_only=False):
         super().__init__()
         self._future_len = future_len
         self._action_len = action_len
@@ -441,11 +473,15 @@ class TransformerDecoder(nn.Module):
         self._future_len = future_len // action_len
         self._input_dim = input_dim
         self._output_dim = ouptut_dim
+        self._diffuse_ego_only = diffuse_ego_only
 
         self.time_embedding = nn.Embedding(self._future_len, 256)
         self.attention_layers = nn.ModuleList([CrossTransformer() for _ in range(4)])
         self.encoder = nn.Sequential(nn.Linear(self._input_dim, 128), nn.ReLU(), nn.Linear(128, 256))
         self.decoder = nn.Sequential(nn.Linear(256, 128), nn.ELU(), nn.Dropout(0.1), nn.Linear(128, self._output_dim))
+
+        if cond_embed_dim is not None:
+            self.cond_proj = nn.Sequential(nn.ReLU(), nn.Linear(cond_embed_dim, 256))
         
         self.register_buffer('casual_mask', self.generate_casual_mask(causal))
         self.register_buffer('time', torch.arange(self._future_len).unsqueeze(0))
@@ -473,18 +509,29 @@ class TransformerDecoder(nn.Module):
 
         return mask
 
-    def forward(self, noisy_trajectories, noise_level, encodings, relations, mask):
+    def forward(self, noisy_trajectories, noise_level, encodings, relations, mask, agents_mask, cond_embed=None, cond_drop_mask=None):
         '''
         noisy_trajectories: [B, Na, T_f, 5]
         '''
         # get query
+        # noisy_trajectories = torch.reshape(noisy_trajectories, (-1, self._agents_len, 
+        #                                                         self._future_len, self._action_len, self._input_dim)) 
         noisy_trajectories = torch.reshape(noisy_trajectories, (-1, self._agents_len, 
-                                                                self._future_len, self._action_len, self._input_dim)) 
+                                                                self._future_len, 1, self._input_dim)) 
         future_states = self.encoder(noisy_trajectories)
         future_states = future_states.max(dim=3).values # [B, Na, T, 256]
         time_embedding = self.time_embedding(self.time) # [1, T, 256]
         query = future_states + time_embedding[:, None] # [B, Na, T, 256]
+        if hasattr(self, "cond_proj"):
+            assert cond_embed is not None
+            cond_embed_proj = self.cond_proj(cond_embed) # B, 256
+            if cond_drop_mask is not None:
+                assert cond_drop_mask.shape[0] == cond_embed_proj.shape[0]
+                cond_embed_proj[cond_drop_mask] = 0
+            query = query + cond_embed_proj[:, None, None, :]
         query = query + noise_level[:, :, None, :] 
+        if self._diffuse_ego_only:
+            query[agents_mask[:, :self._agents_len]] = 0.
 
         # decode denoised actions
         query_content_list = []

@@ -27,7 +27,7 @@ from waymax.utils import geometry
 from .color import *
 from .utils import *
 
-from .vis_utils import plot_road_line, plot_road_edge, plot_stop_sign, plot_crosswalk, plot_speed_bump, plot_traj_with_speed
+from .vis_utils import plot_road_line, plot_road_edge, plot_stop_sign, plot_crosswalk, plot_speed_bump, plot_traj_with_speed, plot_traj_with_speed_gt
 road_type_dict = {
   0:  'RoadLine-Unknown',  # 'Unknown
   1:  'LaneCenter-Freeway',
@@ -214,6 +214,185 @@ def plot_trajectory(
       v_max = 20, #np.ceil(valid_speed.max()),
       show_colorbar=show_colorbar
   )
+
+
+def plot_all_trajectory(
+    ax: matplotlib.axes.Axes,
+    traj: datatypes.Trajectory,
+    is_controlled: np.ndarray,
+    pred_traj,
+    style_dict,
+    control_list,
+    plot_freq,
+    time_idx: Optional[int] = None,
+    indices: Optional[np.ndarray] = None,
+    show_colorbar: bool = False,
+    past_traj_length: int = 0,
+    is_ego = None,
+    is_adv = None
+) -> None:
+  """Plots a Trajectory with different color for controlled and context.
+
+  Plots the full bounding_boxes only for time_idx step, overlap is
+  highlighted.
+
+  Notation: A: number of agents; T: numbe of time steps; 5 degree of freedom:
+  center x, center y, length, width, yaw.
+
+  Args:
+    ax: matplotlib axes.
+    traj: a Trajectory with shape (A, T).
+    is_controlled: binary mask for controlled object, shape (A,).
+    time_idx: step index to highlight bbox, -1 for last step. Default(None) for
+      not showing bbox.
+    indices: ids to show for each agents if not None, shape (A,).
+  """
+  if len(traj.shape) != 2:
+    raise ValueError('traj should have shape (A, T)')
+
+  traj_5dof = np.array(
+      traj.stack_fields(['x', 'y', 'length', 'width', 'yaw'])
+  )  # Forces to np from jnp
+
+  num_obj, num_steps, _ = traj_5dof.shape
+  if time_idx is not None:
+    if time_idx == -1:
+      time_idx = num_steps - 1
+    if time_idx >= num_steps:
+      raise ValueError('time_idx is out of range.')
+
+  # Adds id if needed.
+  if indices is not None and time_idx is not None:
+    for i in range(num_obj):
+      if not traj.valid[i, time_idx]:
+        continue
+      ax.text(
+          traj_5dof[i, time_idx, 0] - 2,
+          traj_5dof[i, time_idx, 1] + 2,
+          f'{indices[i]}',
+          zorder=10,
+          clip_on=True,
+          fontsize = 14,
+      )
+
+  _plot_bounding_boxes(ax, traj_5dof, time_idx, is_controlled, traj.valid, is_ego, is_adv)  # pytype: disable=wrong-arg-types  # jax-ndarray
+
+
+  # # Plot history of controlled agents
+  # start_idx = 0 #max(0, time_idx - past_traj_length)
+  # end_idx = 11 # time_idx
+  # if start_idx < end_idx:
+  #   if is_ego is not None and is_adv is not None:
+  #     is_controlled = is_ego | is_adv
+  #   # Plot history of controlled agents
+  #   vel_xy = np.asarray(traj.vel_xy) # (A, T, 2)
+  #   speed = np.linalg.norm(vel_xy, axis=-1) # (A, T)
+  #   valid_xy = traj_5dof[:, start_idx:end_idx, :2]
+  #   valid_speed = speed[:, start_idx:end_idx]
+  #   control = control_list[0]
+  #   style = style_dict[control]
+  #   # print(valid_speed.min(), valid_speed.max())
+  #   plot_traj_with_speed_gt(
+  #     trajs = valid_xy,
+  #     speeds = valid_speed,
+  #     valids = traj.valid[:, start_idx:end_idx],
+  #     # style = style,
+  #     ax = ax,
+  #     v_min = 0, #np.floor(valid_speed.min()),
+  #     v_max = 20, #np.ceil(valid_speed.max()),
+  #     show_colorbar=show_colorbar,
+  #     # plot_freq=plot_freq,
+  # )
+
+  # # plot future
+  # start_idx = 11 #max(0, time_idx - past_traj_length)
+  # end_idx = 50 # time_idx
+  # if start_idx < end_idx:
+  #   if is_ego is not None and is_adv is not None:
+  #     is_controlled = is_adv
+  #   # Plot history of controlled agents
+  #   vel_xy = np.asarray(traj.vel_xy) # (A, T, 2)
+  #   speed = np.linalg.norm(vel_xy, axis=-1) # (A, T)
+  #   valid_xy = traj_5dof[is_controlled, start_idx:end_idx, :2]
+  #   valid_speed = speed[is_controlled, start_idx:end_idx]
+  #   # print(valid_speed.min(), valid_speed.max())
+  #   plot_traj_with_speed_gt(
+  #     trajs = valid_xy,
+  #     speeds = valid_speed,
+  #     valids = traj.valid[:, start_idx:end_idx],
+  #     ax = ax,
+  #     v_min = 0, #np.floor(valid_speed.min()),
+  #     v_max = 20, #np.ceil(valid_speed.max()),
+  #     show_colorbar=show_colorbar
+  # )
+  # plot future
+  control_ids = np.arange(pred_traj.shape[0])
+  run_ids = np.arange(pred_traj.shape[1])
+  for j in control_ids:
+    control = control_list[j]
+    style = style_dict[control]
+    for i in run_ids:
+      # if i in [0,3,4,6,8,14]: 
+      #   continue
+      ego_traj = pred_traj[j, i]
+      start_idx = 0 #max(0, time_idx - past_traj_length)
+      end_idx = 40 # time_idx
+      if start_idx < end_idx:
+        if is_ego is not None and is_adv is not None:
+          is_controlled = is_ego | is_adv
+        # Plot history of controlled agents
+        vel_xy = np.asarray(ego_traj[:,start_idx:end_idx, 2:4]) # (A, T, 2)
+        speed = np.linalg.norm(vel_xy, axis=-1) # (A, T)
+        valid_xy = ego_traj[:, start_idx:end_idx, :2]
+        valid_speed = speed
+        # print(valid_speed.min(), valid_speed.max())
+        plot_traj_with_speed(
+          trajs = valid_xy,
+          speeds = valid_speed,
+          valids = np.ones((1, valid_xy.shape[1]))==1,
+          style = style,
+          ax = ax,
+          v_min = 0, #np.floor(valid_speed.min()),
+          v_max = 20, #np.ceil(valid_speed.max()),
+          show_colorbar=False,
+          plot_freq=plot_freq,
+      )
+  
+  # # plot future
+  # control_ids = np.arange(pred_traj.shape[0])
+  # run_ids = np.arange(pred_traj.shape[1])
+  # for j in control_ids:
+  #   control = control_list[j]
+  #   style = style_dict[control]
+  #   for i in run_ids:
+  #     if i in [0,3,4,6,8,14,1,2,5,7]: 
+  #       continue
+  #     ego_traj = pred_traj[j, i]
+  #     start_idx = 0 #max(0, time_idx - past_traj_length)
+  #     end_idx = 40 # time_idx
+  #     if start_idx < end_idx:
+  #       if is_ego is not None and is_adv is not None:
+  #         is_controlled = is_ego | is_adv
+  #       # Plot history of controlled agents
+  #       vel_xy = np.asarray(ego_traj[:,start_idx:38, 2:4]) # (A, T, 2)
+  #       speed = np.linalg.norm(vel_xy, axis=-1) # (A, T)
+  #       valid_xy = ego_traj[:, start_idx:38, :2]
+  #       valid_speed = speed
+  #       # print(valid_speed.min(), valid_speed.max())
+  #       plot_traj_with_speed(
+  #         trajs = valid_xy,
+  #         speeds = valid_speed,
+  #         valids = np.ones((1, valid_xy.shape[1]))==1,
+  #         style = style,
+  #         ax = ax,
+  #         v_min = 0, #np.floor(valid_speed.min()),
+  #         v_max = 20, #np.ceil(valid_speed.max()),
+  #         show_colorbar=False,
+  #         plot_freq=plot_freq,
+  #     )
+
+
+
   
 def plot_traffic_light_signals_as_points(
     ax: matplotlib.axes.Axes,
